@@ -69,68 +69,6 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
 
-if dataset_name == "CIFAR100":
-    transform_train = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.4914, 0.4822, 0.4465], std=[0.2023, 0.1994, 0.2010]),
-    ])
-
-    transform_val = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.4914, 0.4822, 0.4465], std=[0.2023, 0.1994, 0.2010]),
-    ])
-
-
-    train_dataset = datasets.CIFAR100(root='/dataset/cifar100', train=True, download=False, transform=transform_train)
-    val_dataset = datasets.CIFAR100(root='/dataset/cifar100', train=False, download=False, transform=transform_val)
-else:
-    transform_train = transforms.Compose([
-        transforms.RandomResizedCrop(64),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-
-    transform_val = transforms.Compose([
-        transforms.Resize(64),
-        transforms.CenterCrop(64),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-
-
-    data_dir = '/dataset/tiny-imagenet-200' 
-    train_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'train'), transform=transform_train)
-    val_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'val'), transform=transform_val)
-
-
-def split_dataset(train_dataset, num_clients, alpha, iid):
-    if iid:
-        return random_split(train_dataset, [len(train_dataset) // num_clients] * num_clients)
-    else:
-        if hasattr(train_dataset, 'targets'):
-            train_labels = train_dataset.targets
-        else:
-            train_labels = np.array([s[1] for s in train_dataset.samples])
-
-        class_indices = defaultdict(list)
-        for idx, label in enumerate(train_labels):
-            class_indices[label].append(idx)
-
-        client_indices = [[] for _ in range(num_clients)]
-        for indices in class_indices.values():
-            proportions = np.random.dirichlet(np.repeat(alpha, num_clients))
-            proportions = np.array([p * (len(client_idx) < len(train_dataset) / num_clients) for p, client_idx in zip(proportions, client_indices)])
-            proportions = proportions / proportions.sum()
-            proportions = (np.cumsum(proportions) * len(indices)).astype(int)[:-1]
-            split_indices = np.split(indices, proportions)
-            for client_idx, split_idx in zip(client_indices, split_indices):
-                client_idx.extend(split_idx)
-
-        return [torch.utils.data.Subset(train_dataset, indices) for indices in client_indices]
-
 client_datasets = split_dataset(train_dataset, num_clients, alpha, iid)
 
 
