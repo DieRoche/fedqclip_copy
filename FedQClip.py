@@ -12,24 +12,27 @@ import matplotlib.pyplot as plt
 import numpy as np
 from collections import defaultdict
 
+args = get_config()
+    
+wandb.init(
+    project="compression_FL",
+    
+    config={k: v for k, v in vars(args).items()}
+    )
 
-num_clients = 4
-num_rounds = 100
-num_epochs_per_round = 5
-eta_c = 0.05  
-gamma_c = 10  
+num_clients = args.n_client
+num_rounds = args.n_epoch
+num_epochs_per_round = args.n_client_epoch
+eta_c = args.lr
+gamma_c = args.gamma_c 
 eta_s = 0.05 
-gamma_s = 1000000  
-quantize = True
-bit = 4
-flag = True  
-alpha = 1.0  
-iid = False  
-batch_size = 64
-model_name = "MobileNetV3"  # or "ResNet18"
-
-dataset_name = "TinyImagenet"  # or "CIFAR100" or "CIFAR10"
-
+gamma_s = args.gamma_s  
+quantize = args.quantize
+bit = args.bit  
+alpha = args.dirichlet   
+batch_size = args.batch_size
+model_name = args.model
+dataset_name = args.dataset
 
 
 class Quantizer:
@@ -60,7 +63,7 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 
-seed = 42
+seed = args.seed
 set_seed(seed)
 
 
@@ -89,24 +92,6 @@ if flag:
 
 criterion = nn.CrossEntropyLoss()
 
-
-def get_model(model_name, dataset_name, device):
-    if model_name == "MobileNetV3":
-        model = models.mobilenet_v3_small(pretrained=True)
-        num_ftrs = model.classifier[3].in_features
-        if dataset_name == "CIFAR100":
-            model.classifier[3] = nn.Linear(num_ftrs, 100)
-        else:
-            model.classifier[3] = nn.Linear(num_ftrs, 200)
-    elif model_name == "ResNet18":
-        model = models.resnet18(pretrained=False)
-        num_ftrs = model.fc.in_features
-        if dataset_name == "CIFAR100":
-            model.fc = nn.Linear(num_ftrs, 100)
-        else:
-            model.fc = nn.Linear(num_ftrs, 200)
-    model = model.to(device)
-    return model
 
 
 global_model = get_model(model_name, dataset_name, device)
@@ -219,7 +204,7 @@ for round in range(num_rounds):
     local_norm_average_all =0.0
     local_loss = 0.0
     for client_id, client_dataset in enumerate(client_datasets):
-        train_loader = DataLoader(client_dataset, batch_size=batch_size, shuffle=True, num_workers=4, drop_last=True)
+        train_loader = DataLoader(client_dataset, batch_size=batch_size, shuffle=True, num_workers=args.client_fraction, drop_last=True)
         client_model = client_models[client_id]
         updated_state_dict, local_norm_max, local_norm_average, loss = train_client(client_model, train_loader, eta_c, gamma_c, num_epochs=num_epochs_per_round)
         client_model.load_state_dict(updated_state_dict)
