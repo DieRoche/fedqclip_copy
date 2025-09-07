@@ -12,13 +12,16 @@ import matplotlib.pyplot as plt
 import numpy as np
 from collections import defaultdict
 
+import wandb
+from config import get_config
+
 args = get_config()
-    
+print(f"Loaded configuration: {args}")
+
 wandb.init(
     project="compression_FL",
-    
-    config={k: v for k, v in vars(args).items()}
-    )
+    config={k: v for k, v in vars(args).items()},
+)
 
 num_clients = args.n_client
 num_rounds = args.n_epoch
