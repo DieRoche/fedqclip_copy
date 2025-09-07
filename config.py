@@ -22,8 +22,7 @@ def get_config():
     parser.add_argument("--dirichlet", type=float, default=0.5)
     parser.add_argument("--n_epoch", type=int, default=100)
     parser.add_argument("--n_client_epoch", type=int, default=5)
-    parser.add_argument("--s", type=int, default=20)
-
+    
     parser.add_argument("--dataset", type=str, default="cifar10")
     parser.add_argument("--train_frac", type=float, default=0.8)
     parser.add_argument("--batch_size", type=int, default=128)
@@ -33,8 +32,8 @@ def get_config():
 
     parser.add_argument("--gamma_c", type=float, default=10)
     parser.add_argument("--gamma_s", type=float, default=1e6)
-    parser.add_argument("--quantize", type=str2bool, default=False)
-    parser.add_argument("--bit", type=int, default=8)
+    parser.add_argument("--quantize", type=str2bool, default=True)
+    parser.add_argument("--bit", type=int, default=16)
     parser.add_argument("--flag", type=str2bool, default=False)
     parser.add_argument("--iid", type=str2bool, default=False)
 
