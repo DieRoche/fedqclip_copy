@@ -14,6 +14,8 @@ from collections import defaultdict
 
 import wandb
 from config import get_config
+from data_utils import get_dataset
+from ResNet18 import ResNet18
 
 args = get_config()
 print(f"Loaded configuration: {args}")
@@ -75,29 +77,12 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
 
-client_datasets = split_dataset(train_dataset, num_clients, alpha, iid)
-
-
-if flag:
-    if hasattr(train_dataset, 'targets'):
-        labels = train_dataset.targets
-    else:
-        labels = [train_dataset.samples[i][1] for i in range(len(train_dataset))]
-    plt.figure(figsize=(20, 3))
-    plt.hist([np.array(labels)[idx] for idx in [ds.indices for ds in client_datasets]], stacked=True,
-             bins=np.arange(min(labels) - 0.5, max(labels) + 1.5, 1),
-             label=["Client {}".format(i + 1) for i in range(num_clients)], rwidth=0.5)
-    plt.xticks(np.arange(len(set(labels))))
-    plt.legend()
-    plt.savefig("data_distribution.png")
-    plt.show()
-
-
+client_datasets, val_dataset, n_classes, _,_ = get_dataset(args)
 criterion = nn.CrossEntropyLoss()
 
 
 
-global_model = get_model(model_name, dataset_name, device)
+global_model = ResNet18(num_classes=n_classes).to(device)
 
 
 def train_client(model, train_loader, eta_c, gamma_c, num_epochs=1):

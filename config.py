@@ -34,8 +34,6 @@ def get_config():
     parser.add_argument("--gamma_s", type=float, default=1e6)
     parser.add_argument("--quantize", type=str2bool, default=True)
     parser.add_argument("--bit", type=int, default=16)
-    parser.add_argument("--flag", type=str2bool, default=False)
-    parser.add_argument("--iid", type=str2bool, default=False)
 
     parser.add_argument("--device", type=str, default="cuda")
 
