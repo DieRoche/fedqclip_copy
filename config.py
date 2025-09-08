@@ -26,6 +26,7 @@ def get_config():
     parser.add_argument("--dataset", type=str, default="cifar10")
     parser.add_argument("--train_frac", type=float, default=0.8)
     parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=0.01)
     parser.add_argument("--model", type=str, default="resnet")
     parser.add_argument("--seed", type=int, default=5)

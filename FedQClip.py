@@ -7,6 +7,7 @@ import torchvision.datasets as datasets
 import torchvision.models as models
 import copy
 import os
+import random
 from torch.nn import init
 import matplotlib.pyplot as plt
 import numpy as np
@@ -34,8 +35,9 @@ eta_s = args.lr
 gamma_s = args.gamma_s  
 quantize = args.quantize
 bit = args.bit  
-alpha = args.dirichlet   
+alpha = args.dirichlet
 batch_size = args.batch_size
+num_workers = args.num_workers
 model_name = args.model
 dataset_name = args.dataset
 
@@ -73,6 +75,20 @@ set_seed(seed)
 
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
+def tensor_dict_bytes(tensor_dict, bit=32):
+    """Calculate communication cost of a tensor dictionary."""
+    return sum(t.nelement() * bit // 8 for t in tensor_dict.values())
+
+
+def dict_to_tensor(state_dict):
+    return torch.cat([v.flatten() for v in state_dict.values()])
+
+
+def cleanup_memory():
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 
@@ -126,32 +142,38 @@ def train_client(model, train_loader, eta_c, gamma_c, num_epochs=1):
         print(f'Client Epoch Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}')
 
     
-    return model.state_dict(), local_epoch_norm_max, local_norm_sum/(num_epochs_per_round*(len(train_loader.dataset)/batch_size)), epoch_loss
+    return (model.state_dict(),
+            local_epoch_norm_max,
+            local_norm_sum/(num_epochs_per_round*(len(train_loader.dataset)/batch_size)),
+            epoch_loss,
+            epoch_acc.item())
 
 def aggregate_models(global_model, client_models, bit, quantize):
     global_dict = global_model.state_dict()
-
+    num_participants = len(client_models)
 
     param_diffs = {name: torch.zeros_like(param).float() for name, param in global_dict.items()}
 
-   
     for client_model in client_models:
         client_dict = client_model.state_dict()
         for name in global_dict.keys():
             param_diffs[name] += global_dict[name] - client_dict[name]
 
-    
     if quantize:
         q = Quantizer(bit)
         for name in global_dict.keys():
             param_diffs[name] = q(param_diffs[name])
         print("quantize success")
 
-    param_diffs_norm = torch.sqrt(sum(torch.norm(param_diffs[name] / (num_clients), p=2)**2 for name in param_diffs.keys()))
-    global_step_size = min(eta_s, (gamma_s * eta_s) / (param_diffs_norm/(num_clients*num_epochs_per_round)))
-   
+    param_diffs_norm = torch.sqrt(
+        sum(torch.norm(param_diffs[name] / num_participants, p=2) ** 2 for name in param_diffs.keys())
+    )
+    global_step_size = min(eta_s, (gamma_s * eta_s) / (param_diffs_norm / (num_participants * num_epochs_per_round)))
+
     for name in global_dict.keys():
-        global_dict[name] = global_dict[name].float() - global_step_size * (param_diffs[name] / (num_clients * eta_c)).float()
+        global_dict[name] = global_dict[name].float() - global_step_size * (
+            param_diffs[name] / (num_participants * eta_c)
+        ).float()
 
     global_model.load_state_dict(global_dict)
     return global_model, param_diffs_norm, global_step_size
@@ -185,27 +207,105 @@ if (os.path.isfile(trainloss_file)):
 f_trainloss = open(trainloss_file, 'a')
 
 
-for round in range(num_rounds):
-    print(f'Round {round + 1}/{num_rounds}')
-    client_models = [copy.deepcopy(global_model) for _ in range(num_clients)]
+total_upload_traffic = 0
+total_download_traffic = 0
+
+for round_idx in range(num_rounds):
+    print(f'Round {round_idx + 1}/{num_rounds}')
+    num_participants = max(1, int(num_clients * args.client_fraction))
+    selected_ids = random.sample(range(num_clients), num_participants)
+    global_state = copy.deepcopy(global_model.state_dict())
+    global_tensor = dict_to_tensor(global_state).to(device)
+
+    client_models = []
+    participating_updates = []
+    cos_sims = []
+    training_losses = []
+    acc_clients = []
     local_norm_max_all = 0.0
-    local_norm_average_all =0.0
-    local_loss = 0.0
-    for client_id, client_dataset in enumerate(client_datasets):
-        train_loader = DataLoader(client_dataset, batch_size=batch_size, shuffle=True, num_workers=args.client_fraction, drop_last=True)
-        client_model = client_models[client_id]
-        updated_state_dict, local_norm_max, local_norm_average, loss = train_client(client_model, train_loader, eta_c, gamma_c, num_epochs=num_epochs_per_round)
+    local_norm_average_all = 0.0
+
+    for client_id in selected_ids:
+        client_dataset = client_datasets[client_id]
+        train_loader = DataLoader(
+            client_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            drop_last=True,
+        )
+        client_model = copy.deepcopy(global_model)
+        updated_state_dict, local_norm_max, local_norm_average, loss, acc_client = train_client(
+            client_model, train_loader, eta_c, gamma_c, num_epochs=num_epochs_per_round
+        )
         client_model.load_state_dict(updated_state_dict)
+        client_models.append(client_model)
         local_norm_max_all += local_norm_max
         local_norm_average_all += local_norm_average
-        local_loss += loss
+        training_losses.append(loss)
+        acc_clients.append(acc_client)
 
-    global_model, global_gradient_norm,global_step_size = aggregate_models(global_model, client_models, bit, quantize)
+        client_tensor = dict_to_tensor(updated_state_dict).to(device)
+        cos = torch.nn.functional.cosine_similarity(global_tensor, client_tensor, dim=0)
+        cos_sims.append(cos.item())
 
+        update = {name: global_state[name] - updated_state_dict[name] for name in global_state.keys()}
+        participating_updates.append(update)
 
-    val_acc = validate_model(global_model, DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, drop_last=True))
-    print(f'Train Loss: {local_loss/num_clients} Valid Acc: {val_acc:.4f} Global Gradient Norm: {global_gradient_norm} \n'
-          f'Local Norm Max: {local_norm_max_all/num_clients} Local Norm Average:{local_norm_average_all/num_clients}')
-    f_trainloss.write(str(local_loss/num_clients) + "\t" + (f"{val_acc.item():.4f}") + "\t" + (f"{global_gradient_norm.item()}") + "\t"
-                      + (f"{local_norm_max_all.item()/num_clients}")+ "\t" +(f"{local_norm_average_all.item()/num_clients}")+"\t"+(f"{global_step_size}")+ '\n')
+    global_model, global_gradient_norm, global_step_size = aggregate_models(global_model, client_models, bit, quantize)
+
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=True)
+    acc = validate_model(global_model, val_loader)
+
+    cos_mean = np.mean(cos_sims)
+    cos_std = np.std(cos_sims)
+    training_loss_mean = np.mean(training_losses)
+    training_loss_std = np.std(training_losses)
+    acc_clients_mean = np.mean(acc_clients)
+    acc_clients_std = np.std(acc_clients)
+    acc_servers = [acc.item()]
+    acc_servers_mean = np.mean(acc_servers)
+    acc_servers_std = np.std(acc_servers)
+
+    report = {
+        "cos_lowest": cos_mean - cos_std,
+        "cos_highest": cos_mean + cos_std,
+        "training_loss_lowest": training_loss_mean - training_loss_std,
+        "training_loss_highest": training_loss_mean + training_loss_std,
+        "acc_clients_lowest": acc_clients_mean - acc_clients_std,
+        "acc_clients_highest": acc_clients_mean + acc_clients_std,
+        "acc_servers_lowest": acc_servers_mean - acc_servers_std,
+        "acc_servers_highest": acc_servers_mean + acc_servers_std,
+    }
+
+    download_traffic = tensor_dict_bytes(global_state, bit=32)
+    upload_bit = bit if quantize else 32
+    upload_traffic = sum(tensor_dict_bytes(update, bit=upload_bit) for update in participating_updates)
+    total_upload_traffic += upload_traffic
+    total_download_traffic += download_traffic
+    report["upload_traffic"] = upload_traffic
+    report["download_traffic"] = download_traffic
+    report["overall_traffic"] = total_upload_traffic + total_download_traffic
+
+    wandb.log(report)
+
+    print(
+        f"Round {round_idx + 1}, Clients Acc: {acc_clients_mean:.4f}, Server Acc: {acc.item():.4f}"
+    )
+    cleanup_memory()
+
+    f_trainloss.write(
+        str(training_loss_mean)
+        + "\t"
+        + (f"{acc.item():.4f}")
+        + "\t"
+        + (f"{global_gradient_norm.item()}")
+        + "\t"
+        + (f"{local_norm_max_all.item()/num_participants}")
+        + "\t"
+        + (f"{local_norm_average_all.item()/num_participants}")
+        + "\t"
+        + (f"{global_step_size}")
+        + '\n'
+    )
     f_trainloss.flush()
