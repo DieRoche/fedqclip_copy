@@ -96,12 +96,19 @@ def cleanup_memory():
 client_datasets, val_dataset, n_classes, _,_ = get_dataset(args)
 criterion = nn.CrossEntropyLoss()
 
-
+# Validation loader reused by all clients and the server
+val_loader = DataLoader(
+    val_dataset,
+    batch_size=batch_size,
+    shuffle=False,
+    num_workers=num_workers,
+    drop_last=True,
+)
 
 global_model = ResNet18(num_classes=n_classes).to(device)
 
 
-def train_client(model, train_loader, eta_c, gamma_c, num_epochs=1):
+def train_client(model, train_loader, eta_c, gamma_c, num_epochs=1, val_loader=None):
     model.train()
     local_epoch_norm_max = 0.0
     local_norm_sum = 0.0
@@ -141,12 +148,30 @@ def train_client(model, train_loader, eta_c, gamma_c, num_epochs=1):
         epoch_acc = running_corrects.double() / len(train_loader.dataset)
         print(f'Client Epoch Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}')
 
-    
-    return (model.state_dict(),
-            local_epoch_norm_max,
-            local_norm_sum/(num_epochs_per_round*(len(train_loader.dataset)/batch_size)),
-            epoch_loss,
-            epoch_acc.item())
+    val_acc = None
+    if val_loader is not None:
+        model.eval()
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for v_inputs, v_labels in val_loader:
+                v_inputs = v_inputs.to(device)
+                v_labels = v_labels.to(device)
+                v_outputs = model(v_inputs)
+                _, v_preds = torch.max(v_outputs, 1)
+                correct += torch.sum(v_preds == v_labels.data)
+                total += v_labels.size(0)
+        val_acc = correct.double() / total
+        print(f'Client Validation Acc: {val_acc:.4f}')
+
+    return (
+        model.state_dict(),
+        local_epoch_norm_max,
+        local_norm_sum / (num_epochs_per_round * (len(train_loader.dataset) / batch_size)),
+        epoch_loss,
+        epoch_acc.item(),
+        val_acc.item() if val_acc is not None else None,
+    )
 
 def aggregate_models(global_model, client_models, bit, quantize):
     global_dict = global_model.state_dict()
@@ -221,7 +246,7 @@ for round_idx in range(num_rounds):
     participating_updates = []
     cos_sims = []
     training_losses = []
-    acc_clients = []
+    val_acc_clients = []
     local_norm_max_all = 0.0
     local_norm_average_all = 0.0
 
@@ -235,15 +260,15 @@ for round_idx in range(num_rounds):
             drop_last=True,
         )
         client_model = copy.deepcopy(global_model)
-        updated_state_dict, local_norm_max, local_norm_average, loss, acc_client = train_client(
-            client_model, train_loader, eta_c, gamma_c, num_epochs=num_epochs_per_round
+        updated_state_dict, local_norm_max, local_norm_average, loss, _, val_acc_client = train_client(
+            client_model, train_loader, eta_c, gamma_c, num_epochs=num_epochs_per_round, val_loader=val_loader
         )
         client_model.load_state_dict(updated_state_dict)
         client_models.append(client_model)
         local_norm_max_all += local_norm_max
         local_norm_average_all += local_norm_average
         training_losses.append(loss)
-        acc_clients.append(acc_client)
+        val_acc_clients.append(val_acc_client)
 
         client_tensor = dict_to_tensor(updated_state_dict).to(device)
         cos = torch.nn.functional.cosine_similarity(global_tensor, client_tensor, dim=0)
@@ -254,15 +279,14 @@ for round_idx in range(num_rounds):
 
     global_model, global_gradient_norm, global_step_size = aggregate_models(global_model, client_models, bit, quantize)
 
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=True)
     acc = validate_model(global_model, val_loader)
 
     cos_mean = np.mean(cos_sims)
     cos_std = np.std(cos_sims)
     training_loss_mean = np.mean(training_losses)
     training_loss_std = np.std(training_losses)
-    acc_clients_mean = np.mean(acc_clients)
-    acc_clients_std = np.std(acc_clients)
+    acc_clients_mean = np.mean(val_acc_clients)
+    acc_clients_std = np.std(val_acc_clients)
     acc_servers = [acc.item()]
     acc_servers_mean = np.mean(acc_servers)
     acc_servers_std = np.std(acc_servers)
@@ -289,9 +313,7 @@ for round_idx in range(num_rounds):
 
     wandb.log(report)
 
-    print(
-        f"Round {round_idx + 1}, Clients Acc: {acc_clients_mean:.4f}, Server Acc: {acc.item():.4f}"
-    )
+    print(f"Round {round_idx + 1}, Clients Val Acc: {acc_clients_mean:.4f}, Server Acc: {acc.item():.4f}")
     cleanup_memory()
 
     f_trainloss.write(
