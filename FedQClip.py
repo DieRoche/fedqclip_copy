@@ -278,7 +278,8 @@ for round_idx in range(num_rounds):
         "acc_servers_highest": acc_servers_mean + acc_servers_std,
     }
 
-    download_traffic = tensor_dict_bytes(global_state, bit=32)
+    # Total download traffic accounts for all participating clients
+    download_traffic = tensor_dict_bytes(global_state, bit=32) * num_participants
     upload_bit = bit if quantize else 32
     upload_traffic = sum(tensor_dict_bytes(update, bit=upload_bit) for update in participating_updates)
     total_upload_traffic += upload_traffic
