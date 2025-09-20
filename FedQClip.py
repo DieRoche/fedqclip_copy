@@ -303,7 +303,7 @@ for round_idx in range(num_rounds):
     }
 
     # Total download traffic accounts for all participating clients
-    download_traffic = tensor_dict_bytes(global_state, bit=32) * num_participants
+    download_traffic = tensor_dict_bytes(global_state, bit=32) * 10
     upload_bit = bit if quantize else 32
     upload_traffic = sum(tensor_dict_bytes(update, bit=upload_bit) for update in participating_updates)
     total_upload_traffic += upload_traffic
