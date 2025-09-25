@@ -12,6 +12,7 @@ from torch.nn import init
 import matplotlib.pyplot as plt
 import numpy as np
 from collections import defaultdict
+import gc
 
 import wandb
 from config import get_config
@@ -87,6 +88,7 @@ def dict_to_tensor(state_dict):
 
 
 def cleanup_memory():
+    gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -173,31 +175,23 @@ def train_client(model, train_loader, eta_c, gamma_c, num_epochs=1, val_loader=N
         val_acc.item() if val_acc is not None else None,
     )
 
-def aggregate_models(global_model, client_models, bit, quantize):
+def aggregate_models(global_model, aggregated_updates, num_participants, bit, quantize):
     global_dict = global_model.state_dict()
-    num_participants = len(client_models)
-
-    param_diffs = {name: torch.zeros_like(param).float() for name, param in global_dict.items()}
-
-    for client_model in client_models:
-        client_dict = client_model.state_dict()
-        for name in global_dict.keys():
-            param_diffs[name] += global_dict[name] - client_dict[name]
 
     if quantize:
         q = Quantizer(bit)
-        for name in global_dict.keys():
-            param_diffs[name] = q(param_diffs[name])
+        for name in aggregated_updates.keys():
+            aggregated_updates[name] = q(aggregated_updates[name])
         print("quantize success")
 
     param_diffs_norm = torch.sqrt(
-        sum(torch.norm(param_diffs[name] / num_participants, p=2) ** 2 for name in param_diffs.keys())
+        sum(torch.norm(aggregated_updates[name] / num_participants, p=2) ** 2 for name in aggregated_updates.keys())
     )
     global_step_size = min(eta_s, (gamma_s * eta_s) / (param_diffs_norm / (num_participants * num_epochs_per_round)))
 
     for name in global_dict.keys():
         global_dict[name] = global_dict[name].float() - global_step_size * (
-            param_diffs[name] / (num_participants * eta_c)
+            aggregated_updates[name] / (num_participants * eta_c)
         ).float()
 
     global_model.load_state_dict(global_dict)
@@ -242,13 +236,13 @@ for round_idx in range(num_rounds):
     global_state = copy.deepcopy(global_model.state_dict())
     global_tensor = dict_to_tensor(global_state).to(device)
 
-    client_models = []
     participating_updates = []
     cos_sims = []
     training_losses = []
     val_acc_clients = []
     local_norm_max_all = 0.0
     local_norm_average_all = 0.0
+    aggregated_updates = {name: torch.zeros_like(param) for name, param in global_state.items()}
 
     for client_id in selected_ids:
         client_dataset = client_datasets[client_id]
@@ -263,8 +257,6 @@ for round_idx in range(num_rounds):
         updated_state_dict, local_norm_max, local_norm_average, loss, _, val_acc_client = train_client(
             client_model, train_loader, eta_c, gamma_c, num_epochs=num_epochs_per_round, val_loader=val_loader
         )
-        client_model.load_state_dict(updated_state_dict)
-        client_models.append(client_model)
         local_norm_max_all += local_norm_max
         local_norm_average_all += local_norm_average
         training_losses.append(loss)
@@ -276,8 +268,16 @@ for round_idx in range(num_rounds):
 
         update = {name: global_state[name] - updated_state_dict[name] for name in global_state.keys()}
         participating_updates.append(update)
+        for name in aggregated_updates.keys():
+            aggregated_updates[name] += update[name]
 
-    global_model, global_gradient_norm, global_step_size = aggregate_models(global_model, client_models, bit, quantize)
+        del updated_state_dict
+        del client_model
+        cleanup_memory()
+
+    global_model, global_gradient_norm, global_step_size = aggregate_models(
+        global_model, aggregated_updates, num_participants, bit, quantize
+    )
 
     acc = validate_model(global_model, val_loader)
 
