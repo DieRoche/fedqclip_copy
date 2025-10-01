@@ -37,7 +37,7 @@ The script has several parameters that can be adjusted:
 - `alpha`: Dirichlet distribution parameter to control non-IID data distribution.
 - `iid`: Whether to split data in an IID manner.
 - `batch_size`: Batch size for training.
-- `model_name`: Model architecture to use (`MobileNetV3`, `ResNet18`, `DenseNet`).
+- `model_name`: Model architecture to use (`ResNet18`, `EfficientNetB0_CIFAR`).
 - `dataset_name`: Dataset to use (`CIFAR10`, `CIFAR100`, `TinyImageNet`).
 
 ### Running the Script
@@ -49,7 +49,7 @@ python federated_learning.py
 
 Here's an example of how to run the script with specific parameters:
 ```sh
-python FedQClip.py --num_clients 10 --num_rounds 50 --num_epochs_per_round 3 --eta_c 0.01 --gamma_c 10000 --eta_s 0.01 --gamma_s 10000 --quantize True --bit 8 --flag True --alpha 0.5 --iid False --batch_size 32 --model_name ResNet18 --dataset_name CIFAR10
+python FedQClip.py --n_client 10 --n_epoch 50 --n_client_epoch 3 --lr 0.01 --gamma_c 10000 --gamma_s 10000 --quantize True --bit 8 --dirichlet 0.5 --batch_size 32 --model effnet --dataset cifar100
 ```
 ### Output
 
