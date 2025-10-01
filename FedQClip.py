@@ -306,6 +306,8 @@ for round_idx in range(num_rounds):
     download_traffic = tensor_dict_bytes(global_state, bit=32) * 10
     upload_bit = bit if quantize else 32
     upload_traffic = sum(tensor_dict_bytes(update, bit=upload_bit) for update in participating_updates)
+    upload_traffic_per_client = upload_traffic / num_participants
+    report["upload_traffic_per_client"] = upload_traffic_per_client
     total_upload_traffic += upload_traffic
     total_download_traffic += download_traffic
     report["upload_traffic"] = upload_traffic
