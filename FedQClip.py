@@ -18,6 +18,7 @@ import wandb
 from config import get_config
 from data_utils import get_dataset
 from ResNet18 import ResNet18
+from effnet import EfficientNetB0_CIFAR
 
 args = get_config()
 print(f"Loaded configuration: {args}")
@@ -107,7 +108,20 @@ val_loader = DataLoader(
     drop_last=True,
 )
 
-global_model = ResNet18(num_classes=n_classes).to(device)
+def build_model(name: str, num_classes: int, dataset: str):
+    name = name.lower()
+    if name in {"resnet", "resnet18"}:
+        return ResNet18(num_classes=num_classes)
+    if name in {"effnet", "efficientnet", "efficientnet-b0", "efficientnetb0"}:
+        if dataset not in {"cifar10", "cifar100"}:
+            raise ValueError(
+                f"EfficientNetB0_CIFAR currently supports CIFAR datasets, got '{dataset}'."
+            )
+        return EfficientNetB0_CIFAR(num_classes=num_classes)
+    raise ValueError(f"Unknown model '{name}'.")
+
+
+global_model = build_model(model_name, n_classes, dataset_name).to(device)
 
 
 def train_client(model, train_loader, eta_c, gamma_c, num_epochs=1, val_loader=None):
