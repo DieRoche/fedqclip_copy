@@ -190,7 +190,6 @@ def get_dataset(args):
         data = datasets.CIFAR10(root=".", download=True, transform=transform)
         
     elif args.dataset == 'cifar100':
-        data = datasets.CIFAR100(root=".", download=True)
         n_classes = 100
         transform = transforms.Compose(
             [
@@ -201,6 +200,7 @@ def get_dataset(args):
                 ),
             ]
         )
+        data = datasets.CIFAR100(root=".", download=True, transform=transform)
     else:
         raise NotImplementedError
 
