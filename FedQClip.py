@@ -47,6 +47,8 @@ dataset_name = args.dataset
 class Quantizer:
     def __init__(self, b, *args, **kwargs):
         self.bit = b
+        self.compression_flops = 0.0
+        self.decompression_flops = 0.0
 
     def __str__(self):
         return f"{self.bit}-bit quantization"
@@ -56,12 +58,20 @@ class Quantizer:
             ma = x.max().item()
             mi = x.min().item()
             if ma == mi:
-                return x  
+                return x
+            numel = x.numel()
             k = ((1 << self.bit) - 1) / (ma - mi)
             b = -mi * k
+            # Quantization includes finding the min/max (approximated as 2 ops per element),
+            # the affine transform (multiply and add) and the rounding operation.
+            compression_ops = (2 * numel) + 3 + (numel * 3)
             x_qu = torch.round(k * x + b)
+            # Dequantization corresponds to subtracting the bias and dividing by the scale.
+            decompression_ops = numel * 2
             x_qu -= b
             x_qu /= k
+            self.compression_flops += compression_ops
+            self.decompression_flops += decompression_ops
             return x_qu
 
 
@@ -214,11 +224,15 @@ def train_client(
 def aggregate_models(global_model, aggregated_updates, num_participants, bit, quantize):
     global_dict = global_model.state_dict()
 
+    compression_flops = 0.0
+    decompression_flops = 0.0
     if quantize:
         q = Quantizer(bit)
         for name in aggregated_updates.keys():
             aggregated_updates[name] = q(aggregated_updates[name])
         print("quantize success")
+        compression_flops = q.compression_flops
+        decompression_flops = q.decompression_flops
 
     param_diffs_norm = torch.sqrt(
         sum(torch.norm(aggregated_updates[name] / num_participants, p=2) ** 2 for name in aggregated_updates.keys())
@@ -231,7 +245,7 @@ def aggregate_models(global_model, aggregated_updates, num_participants, bit, qu
         ).float()
 
     global_model.load_state_dict(global_dict)
-    return global_model, param_diffs_norm, global_step_size
+    return global_model, param_diffs_norm, global_step_size, compression_flops, decompression_flops
 
 
 def validate_model(model, val_loader, forward_flops_per_sample=None):
@@ -272,6 +286,8 @@ f_trainloss = open(trainloss_file, 'a')
 total_upload_traffic = 0
 total_download_traffic = 0
 total_flops = 0.0
+total_compression_flops = 0.0
+total_decompression_flops = 0.0
 
 for round_idx in range(num_rounds):
     print(f'Round {round_idx + 1}/{num_rounds}')
@@ -335,15 +351,23 @@ for round_idx in range(num_rounds):
         del client_model
         cleanup_memory()
 
-    global_model, global_gradient_norm, global_step_size = aggregate_models(
-        global_model, aggregated_updates, num_participants, bit, quantize
-    )
+    (
+        global_model,
+        global_gradient_norm,
+        global_step_size,
+        compression_flops,
+        decompression_flops,
+    ) = aggregate_models(global_model, aggregated_updates, num_participants, bit, quantize)
 
     acc, server_eval_flops = validate_model(
         global_model, val_loader, forward_flops_per_sample=model_flops["forward"]
     )
     round_flops += server_eval_flops
     total_flops += round_flops
+    round_compression_flops = compression_flops
+    round_decompression_flops = decompression_flops
+    total_compression_flops += round_compression_flops
+    total_decompression_flops += round_decompression_flops
 
     cos_mean = np.mean(cos_sims)
     cos_std = np.std(cos_sims)
@@ -379,6 +403,13 @@ for round_idx in range(num_rounds):
     report["overall_traffic"] = total_upload_traffic + total_download_traffic
     report["round_flops"] = round_flops
     report["total_flops"] = total_flops
+    report["round_flops_compression"] = round_compression_flops
+    report["round_flops_decompression"] = round_decompression_flops
+    report["total_flops_compression"] = total_compression_flops
+    report["total_flops_decompression"] = total_decompression_flops
+    report["total_flops_including_compression"] = (
+        total_flops + total_compression_flops + total_decompression_flops
+    )
 
     wandb.log(report)
 
