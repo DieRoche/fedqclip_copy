@@ -306,7 +306,7 @@ initial_report = {
     "total_flops_including_compression": total_flops,
 }
 wandb.log(initial_report, step=0)
-print(f"Initial Validation Acc: {initial_acc:.4f}")
+print(f"Initial Validation Acc: {initial_acc.item():.4f}")
 
 for round_idx in range(num_rounds):
     print(f'Round {round_idx + 1}/{num_rounds}')
