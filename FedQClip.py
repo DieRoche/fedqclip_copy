@@ -289,6 +289,25 @@ total_flops = 0.0
 total_compression_flops = 0.0
 total_decompression_flops = 0.0
 
+# Log the initial (round 0) metrics so that WandB captures the baseline accuracy.
+initial_acc, initial_eval_flops = validate_model(
+    global_model, val_loader, forward_flops_per_sample=model_flops["forward"]
+)
+total_flops += initial_eval_flops
+initial_report = {
+    "round": 0,
+    "acc_servers": initial_acc.item(),
+    "acc_servers_lowest": initial_acc.item(),
+    "acc_servers_highest": initial_acc.item(),
+    "round_flops": initial_eval_flops,
+    "total_flops": total_flops,
+    "total_flops_compression": total_compression_flops,
+    "total_flops_decompression": total_decompression_flops,
+    "total_flops_including_compression": total_flops,
+}
+wandb.log(initial_report, step=0)
+print(f"Initial Validation Acc: {initial_acc:.4f}")
+
 for round_idx in range(num_rounds):
     print(f'Round {round_idx + 1}/{num_rounds}')
     num_participants = max(1, int(num_clients * args.client_fraction))
@@ -411,7 +430,9 @@ for round_idx in range(num_rounds):
         total_flops + total_compression_flops + total_decompression_flops
     )
 
-    wandb.log(report)
+    report["round"] = round_idx + 1
+
+    wandb.log(report, step=round_idx + 1)
 
     print(f"Round {round_idx + 1}, Clients Val Acc: {acc_clients_mean:.4f}, Server Acc: {acc.item():.4f}")
     cleanup_memory()
