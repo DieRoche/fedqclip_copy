@@ -124,10 +124,30 @@ def build_model(name: str, num_classes: int, dataset: str):
 global_model = build_model(model_name, n_classes, dataset_name).to(device)
 
 
-def train_client(model, train_loader, eta_c, gamma_c, num_epochs=1, val_loader=None):
+def estimate_flops_per_sample(model):
+    total_params = sum(p.numel() for p in model.parameters())
+    forward_flops = float(total_params)
+    return {
+        "forward": forward_flops,
+        "forward_backward": forward_flops * 2,
+    }
+
+
+def train_client(
+    model,
+    train_loader,
+    eta_c,
+    gamma_c,
+    num_epochs=1,
+    val_loader=None,
+    flops_per_sample=None,
+):
     model.train()
     local_epoch_norm_max = 0.0
     local_norm_sum = 0.0
+    client_flops = 0.0
+    if flops_per_sample is None:
+        flops_per_sample = estimate_flops_per_sample(model)["forward_backward"]
     for epoch in range(num_epochs):
         running_loss = 0.0
         running_corrects = 0
@@ -158,6 +178,7 @@ def train_client(model, train_loader, eta_c, gamma_c, num_epochs=1, val_loader=N
             running_corrects += torch.sum(preds == labels.data)
             if local_epoch_norm >= local_epoch_norm_max:
                 local_epoch_norm_max = local_epoch_norm
+            client_flops += flops_per_sample * inputs.size(0)
             local_norm_sum += local_epoch_norm
             # print(f'Local Epoch Norm: {local_epoch_norm:.4f}')
         epoch_loss = running_loss / len(train_loader.dataset)
@@ -187,6 +208,7 @@ def train_client(model, train_loader, eta_c, gamma_c, num_epochs=1, val_loader=N
         epoch_loss,
         epoch_acc.item(),
         val_acc.item() if val_acc is not None else None,
+        client_flops,
     )
 
 def aggregate_models(global_model, aggregated_updates, num_participants, bit, quantize):
@@ -212,10 +234,13 @@ def aggregate_models(global_model, aggregated_updates, num_participants, bit, qu
     return global_model, param_diffs_norm, global_step_size
 
 
-def validate_model(model, val_loader):
+def validate_model(model, val_loader, forward_flops_per_sample=None):
     model.eval()
     running_loss = 0.0
     running_corrects = 0
+    eval_flops = 0.0
+    if forward_flops_per_sample is None:
+        forward_flops_per_sample = estimate_flops_per_sample(model)["forward"]
     with torch.no_grad():
         for inputs, labels in val_loader:
             inputs = inputs.to(device)
@@ -227,11 +252,15 @@ def validate_model(model, val_loader):
 
             running_loss += loss.item() * inputs.size(0)
             running_corrects += torch.sum(preds == labels.data)
+            eval_flops += forward_flops_per_sample * inputs.size(0)
 
     val_loss = running_loss / len(val_loader.dataset)
     val_acc = running_corrects.double() / len(val_loader.dataset)
     print(f'Validation Loss: {val_loss:.4f} Acc: {val_acc:.4f}')
-    return val_acc
+    return val_acc, eval_flops
+
+
+model_flops = estimate_flops_per_sample(global_model)
 
 
 trainloss_file = './trainloss' + '_'+model_name+'.txt'
@@ -242,6 +271,7 @@ f_trainloss = open(trainloss_file, 'a')
 
 total_upload_traffic = 0
 total_download_traffic = 0
+total_flops = 0.0
 
 for round_idx in range(num_rounds):
     print(f'Round {round_idx + 1}/{num_rounds}')
@@ -257,6 +287,7 @@ for round_idx in range(num_rounds):
     local_norm_max_all = 0.0
     local_norm_average_all = 0.0
     aggregated_updates = {name: torch.zeros_like(param) for name, param in global_state.items()}
+    round_flops = 0.0
 
     for client_id in selected_ids:
         client_dataset = client_datasets[client_id]
@@ -268,13 +299,28 @@ for round_idx in range(num_rounds):
             drop_last=True,
         )
         client_model = copy.deepcopy(global_model)
-        updated_state_dict, local_norm_max, local_norm_average, loss, _, val_acc_client = train_client(
-            client_model, train_loader, eta_c, gamma_c, num_epochs=num_epochs_per_round, val_loader=val_loader
+        (
+            updated_state_dict,
+            local_norm_max,
+            local_norm_average,
+            loss,
+            _,
+            val_acc_client,
+            client_flops,
+        ) = train_client(
+            client_model,
+            train_loader,
+            eta_c,
+            gamma_c,
+            num_epochs=num_epochs_per_round,
+            val_loader=val_loader,
+            flops_per_sample=model_flops["forward_backward"],
         )
         local_norm_max_all += local_norm_max
         local_norm_average_all += local_norm_average
         training_losses.append(loss)
         val_acc_clients.append(val_acc_client)
+        round_flops += client_flops
 
         client_tensor = dict_to_tensor(updated_state_dict).to(device)
         cos = torch.nn.functional.cosine_similarity(global_tensor, client_tensor, dim=0)
@@ -293,7 +339,11 @@ for round_idx in range(num_rounds):
         global_model, aggregated_updates, num_participants, bit, quantize
     )
 
-    acc = validate_model(global_model, val_loader)
+    acc, server_eval_flops = validate_model(
+        global_model, val_loader, forward_flops_per_sample=model_flops["forward"]
+    )
+    round_flops += server_eval_flops
+    total_flops += round_flops
 
     cos_mean = np.mean(cos_sims)
     cos_std = np.std(cos_sims)
@@ -327,6 +377,8 @@ for round_idx in range(num_rounds):
     report["upload_traffic"] = upload_traffic
     report["download_traffic"] = download_traffic
     report["overall_traffic"] = total_upload_traffic + total_download_traffic
+    report["round_flops"] = round_flops
+    report["total_flops"] = total_flops
 
     wandb.log(report)
 
