@@ -94,6 +94,19 @@ def tensor_dict_bytes(tensor_dict, bit=32):
     return sum(t.nelement() * bit // 8 for t in tensor_dict.values())
 
 
+def tensor_dict_sparsity_mean(tensor_dict):
+    """Calculate the mean sparsity (ratio of zero elements) across tensors."""
+    total_zeros = 0
+    total_elements = 0
+    with torch.no_grad():
+        for tensor in tensor_dict.values():
+            total_zeros += torch.count_nonzero(tensor == 0).item()
+            total_elements += tensor.numel()
+    if total_elements == 0:
+        return 0.0
+    return total_zeros / total_elements
+
+
 def dict_to_tensor(state_dict):
     return torch.cat([v.flatten() for v in state_dict.values()])
 
@@ -415,10 +428,16 @@ for round_idx in range(num_rounds):
     upload_traffic = sum(tensor_dict_bytes(update, bit=upload_bit) for update in participating_updates)
     upload_traffic_per_client = upload_traffic / num_participants
     report["upload_traffic_per_client"] = upload_traffic_per_client
+    upload_sparsity_mean = float(
+        np.mean([tensor_dict_sparsity_mean(update) for update in participating_updates])
+    )
+    download_sparsity_mean = tensor_dict_sparsity_mean(global_state)
     total_upload_traffic += upload_traffic
     total_download_traffic += download_traffic
     report["upload_traffic"] = upload_traffic
     report["download_traffic"] = download_traffic
+    report["upload_sparsity_mean"] = upload_sparsity_mean
+    report["download_sparsity_mean"] = download_sparsity_mean
     report["overall_traffic"] = total_upload_traffic + total_download_traffic
     report["round_flops"] = round_flops
     report["total_flops"] = total_flops
