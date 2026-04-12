@@ -24,9 +24,15 @@ from effnet import EfficientNetB0_CIFAR
 args = get_config()
 print(f"Loaded configuration: {args}")
 
+participating_clients = int(args.client_fraction * args.n_client)
+wandb_run_name = (
+    f"FedQClip_{args.dataset}_{args.model}_{participating_clients}cl"
+)
+
 wandb.init(
     project="compression_FL",
     config={k: v for k, v in vars(args).items()},
+    name=wandb_run_name,
 )
 
 num_clients = args.n_client
