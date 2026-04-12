@@ -333,15 +333,19 @@ def train_client(
     local_epoch_norm_max = 0.0
     local_norm_sum = 0.0
     client_flops = 0.0
+    processed_samples = 0
+    processed_steps = 0
     if flops_per_sample is None:
         flops_per_sample = estimate_flops_per_sample(model)["forward_backward"]
     for epoch in range(num_epochs):
         running_loss = 0.0
-        running_corrects = 0
+        running_corrects = 0.0
 
         for inputs, labels in train_loader:
             inputs = inputs.to(device)
             labels = labels.to(device)
+            processed_samples += inputs.size(0)
+            processed_steps += 1
 
          
             outputs = model(inputs)
@@ -362,20 +366,21 @@ def train_client(
             model.load_state_dict(state_dict)
             local_epoch_norm = torch.sqrt(sum(param.grad.norm(p=2) ** 2 for name, param in model.named_parameters()))
             running_loss += loss.item() * inputs.size(0)
-            running_corrects += torch.sum(preds == labels.data)
+            running_corrects += torch.sum(preds == labels.data).item()
             if local_epoch_norm >= local_epoch_norm_max:
-                local_epoch_norm_max = local_epoch_norm
+                local_epoch_norm_max = local_epoch_norm.item()
             client_flops += flops_per_sample * inputs.size(0)
-            local_norm_sum += local_epoch_norm
+            local_norm_sum += local_epoch_norm.item()
             # print(f'Local Epoch Norm: {local_epoch_norm:.4f}')
-        epoch_loss = running_loss / len(train_loader.dataset)
-        epoch_acc = running_corrects.double() / len(train_loader.dataset)
+        epoch_den = max(1, len(train_loader.dataset))
+        epoch_loss = running_loss / epoch_den
+        epoch_acc = running_corrects / epoch_den
         print(f'Client Epoch Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}')
 
     val_acc = None
     if val_loader is not None:
         model.eval()
-        correct = 0
+        correct = 0.0
         total = 0
         with torch.no_grad():
             for v_inputs, v_labels in val_loader:
@@ -383,18 +388,19 @@ def train_client(
                 v_labels = v_labels.to(device)
                 v_outputs = model(v_inputs)
                 _, v_preds = torch.max(v_outputs, 1)
-                correct += torch.sum(v_preds == v_labels.data)
+                correct += torch.sum(v_preds == v_labels.data).item()
                 total += v_labels.size(0)
-        val_acc = correct.double() / total
+        val_acc = correct / max(1, total)
         print(f'Client Validation Acc: {val_acc:.4f}')
 
+    local_norm_den = max(1, processed_steps)
     return (
         model.state_dict(),
         local_epoch_norm_max,
-        local_norm_sum / (num_epochs_per_round * (len(train_loader.dataset) / batch_size)),
+        local_norm_sum / local_norm_den,
         epoch_loss,
-        epoch_acc.item(),
-        val_acc.item() if val_acc is not None else None,
+        float(epoch_acc),
+        float(val_acc) if val_acc is not None else None,
         client_flops,
     )
 
@@ -418,7 +424,7 @@ def aggregate_models(global_model, aggregated_updates, num_participants):
 def validate_model(model, val_loader, forward_flops_per_sample=None):
     model.eval()
     running_loss = 0.0
-    running_corrects = 0
+    running_corrects = 0.0
     eval_flops = 0.0
     if forward_flops_per_sample is None:
         forward_flops_per_sample = estimate_flops_per_sample(model)["forward"]
@@ -432,13 +438,14 @@ def validate_model(model, val_loader, forward_flops_per_sample=None):
             loss = criterion(outputs, labels)
 
             running_loss += loss.item() * inputs.size(0)
-            running_corrects += torch.sum(preds == labels.data)
+            running_corrects += torch.sum(preds == labels.data).item()
             eval_flops += forward_flops_per_sample * inputs.size(0)
 
-    val_loss = running_loss / len(val_loader.dataset)
-    val_acc = running_corrects.double() / len(val_loader.dataset)
+    eval_den = max(1, len(val_loader.dataset))
+    val_loss = running_loss / eval_den
+    val_acc = running_corrects / eval_den
     print(f'Validation Loss: {val_loss:.4f} Acc: {val_acc:.4f}')
-    return val_acc, eval_flops
+    return torch.tensor(val_acc), eval_flops
 
 
 model_flops = estimate_flops_per_sample(global_model)
@@ -644,9 +651,9 @@ for round_idx in range(num_rounds):
         + "\t"
         + (f"{global_gradient_norm.item()}")
         + "\t"
-        + (f"{local_norm_max_all.item()/num_participants}")
+        + (f"{local_norm_max_all/num_participants}")
         + "\t"
-        + (f"{local_norm_average_all.item()/num_participants}")
+        + (f"{local_norm_average_all/num_participants}")
         + "\t"
         + (f"{global_step_size}")
         + '\n'
