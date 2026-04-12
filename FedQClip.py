@@ -8,6 +8,7 @@ import torchvision.models as models
 import copy
 import os
 import random
+import struct
 from torch.nn import init
 import matplotlib.pyplot as plt
 import numpy as np
@@ -107,6 +108,163 @@ def tensor_dict_sparsity_mean(tensor_dict):
     return total_zeros / total_elements
 
 
+def _dtype_from_bit(bit):
+    if bit <= 8:
+        return torch.uint8, np.uint8
+    if bit <= 16:
+        return torch.uint16, np.uint16
+    return torch.uint32, np.uint32
+
+
+def quantize_client_payload(tensor_dict, bit):
+    """Client-side quantization of an upload payload."""
+    quantized_payload = {}
+    compression_flops = 0.0
+    for name in sorted(tensor_dict.keys()):
+        tensor = tensor_dict[name].detach().cpu().float()
+        numel = tensor.numel()
+        ma = tensor.max().item()
+        mi = tensor.min().item()
+        if ma == mi:
+            quantized_tensor = torch.zeros_like(tensor, dtype=torch.uint8)
+            tensor_bit = 0
+            compression_flops += (2 * numel) + 3
+        else:
+            torch_dtype, _ = _dtype_from_bit(bit)
+            k = ((1 << bit) - 1) / (ma - mi)
+            b = -mi * k
+            quantized_tensor = torch.round(k * tensor + b).to(torch_dtype)
+            tensor_bit = bit
+            compression_flops += (2 * numel) + 3 + (numel * 3)
+        quantized_payload[name] = {
+            "shape": tuple(tensor.shape),
+            "min": mi,
+            "max": ma,
+            "bit": tensor_bit,
+            "values": quantized_tensor,
+        }
+    return quantized_payload, compression_flops
+
+
+def serialize_client_payload(payload, quantized=True):
+    """
+    Serialize client payload into deterministic bytes.
+    - quantized=True expects output from quantize_client_payload.
+    - quantized=False expects a tensor dict and serializes float32 tensors directly.
+    """
+    mode = 1 if quantized else 0
+    packet = bytearray()
+    packet.extend(b"FQCP")
+    packet.extend(struct.pack("<B", mode))
+    packet.extend(struct.pack("<I", len(payload)))
+
+    for name in sorted(payload.keys()):
+        name_bytes = name.encode("utf-8")
+        packet.extend(struct.pack("<H", len(name_bytes)))
+        packet.extend(name_bytes)
+        if quantized:
+            entry = payload[name]
+            shape = entry["shape"]
+            packet.extend(struct.pack("<B", len(shape)))
+            for dim in shape:
+                packet.extend(struct.pack("<I", int(dim)))
+            packet.extend(struct.pack("<B", int(entry["bit"])))
+            packet.extend(struct.pack("<ff", float(entry["min"]), float(entry["max"])))
+            values = entry["values"].contiguous().view(-1).cpu().numpy()
+            raw_bytes = values.tobytes(order="C")
+            packet.extend(struct.pack("<I", len(raw_bytes)))
+            packet.extend(raw_bytes)
+        else:
+            tensor = payload[name].detach().cpu().float().contiguous()
+            shape = tuple(tensor.shape)
+            packet.extend(struct.pack("<B", len(shape)))
+            for dim in shape:
+                packet.extend(struct.pack("<I", int(dim)))
+            raw_bytes = tensor.view(-1).numpy().astype(np.float32, copy=False).tobytes(order="C")
+            packet.extend(struct.pack("<I", len(raw_bytes)))
+            packet.extend(raw_bytes)
+    return bytes(packet)
+
+
+def deserialize_client_payload(serialized_payload):
+    """Server-side deserialization of client bytes."""
+    offset = 0
+    magic = serialized_payload[offset:offset + 4]
+    offset += 4
+    if magic != b"FQCP":
+        raise ValueError("Invalid client payload header.")
+
+    mode = struct.unpack_from("<B", serialized_payload, offset)[0]
+    offset += 1
+    num_tensors = struct.unpack_from("<I", serialized_payload, offset)[0]
+    offset += 4
+
+    payload = {}
+    for _ in range(num_tensors):
+        key_len = struct.unpack_from("<H", serialized_payload, offset)[0]
+        offset += 2
+        name = serialized_payload[offset:offset + key_len].decode("utf-8")
+        offset += key_len
+        ndim = struct.unpack_from("<B", serialized_payload, offset)[0]
+        offset += 1
+        shape = []
+        for _ in range(ndim):
+            dim = struct.unpack_from("<I", serialized_payload, offset)[0]
+            offset += 4
+            shape.append(dim)
+        raw_len = None
+        if mode == 1:
+            tensor_bit = struct.unpack_from("<B", serialized_payload, offset)[0]
+            offset += 1
+            mi, ma = struct.unpack_from("<ff", serialized_payload, offset)
+            offset += 8
+            raw_len = struct.unpack_from("<I", serialized_payload, offset)[0]
+            offset += 4
+            raw = serialized_payload[offset:offset + raw_len]
+            offset += raw_len
+            _, np_dtype = _dtype_from_bit(max(1, tensor_bit))
+            values = np.frombuffer(raw, dtype=np_dtype).copy()
+            payload[name] = {
+                "shape": tuple(shape),
+                "bit": int(tensor_bit),
+                "min": float(mi),
+                "max": float(ma),
+                "values": torch.from_numpy(values.reshape(-1)),
+            }
+        else:
+            raw_len = struct.unpack_from("<I", serialized_payload, offset)[0]
+            offset += 4
+            raw = serialized_payload[offset:offset + raw_len]
+            offset += raw_len
+            values = np.frombuffer(raw, dtype=np.float32).copy()
+            payload[name] = {
+                "shape": tuple(shape),
+                "values": torch.from_numpy(values.reshape(shape)).float(),
+            }
+    return payload, mode
+
+
+def dequantize_client_payload(payload):
+    """Server-side reconstruction of quantized client update tensors."""
+    reconstructed = {}
+    decompression_flops = 0.0
+    for name in sorted(payload.keys()):
+        entry = payload[name]
+        shape = entry["shape"]
+        numel = int(np.prod(shape)) if len(shape) > 0 else 1
+        bit = entry["bit"]
+        if bit == 0 or entry["max"] == entry["min"]:
+            tensor = torch.full(shape, entry["min"], dtype=torch.float32)
+        else:
+            k = ((1 << bit) - 1) / (entry["max"] - entry["min"])
+            b = -entry["min"] * k
+            values = entry["values"].float()
+            tensor = ((values - b) / k).view(shape)
+            decompression_flops += numel * 2
+        reconstructed[name] = tensor
+    return reconstructed, decompression_flops
+
+
 def dict_to_tensor(state_dict):
     return torch.cat([v.flatten() for v in state_dict.values()])
 
@@ -169,15 +327,19 @@ def train_client(
     local_epoch_norm_max = 0.0
     local_norm_sum = 0.0
     client_flops = 0.0
+    processed_samples = 0
+    processed_steps = 0
     if flops_per_sample is None:
         flops_per_sample = estimate_flops_per_sample(model)["forward_backward"]
     for epoch in range(num_epochs):
         running_loss = 0.0
-        running_corrects = 0
+        running_corrects = 0.0
 
         for inputs, labels in train_loader:
             inputs = inputs.to(device)
             labels = labels.to(device)
+            processed_samples += inputs.size(0)
+            processed_steps += 1
 
          
             outputs = model(inputs)
@@ -198,20 +360,21 @@ def train_client(
             model.load_state_dict(state_dict)
             local_epoch_norm = torch.sqrt(sum(param.grad.norm(p=2) ** 2 for name, param in model.named_parameters()))
             running_loss += loss.item() * inputs.size(0)
-            running_corrects += torch.sum(preds == labels.data)
+            running_corrects += torch.sum(preds == labels.data).item()
             if local_epoch_norm >= local_epoch_norm_max:
-                local_epoch_norm_max = local_epoch_norm
+                local_epoch_norm_max = local_epoch_norm.item()
             client_flops += flops_per_sample * inputs.size(0)
-            local_norm_sum += local_epoch_norm
+            local_norm_sum += local_epoch_norm.item()
             # print(f'Local Epoch Norm: {local_epoch_norm:.4f}')
-        epoch_loss = running_loss / len(train_loader.dataset)
-        epoch_acc = running_corrects.double() / len(train_loader.dataset)
+        epoch_den = max(1, len(train_loader.dataset))
+        epoch_loss = running_loss / epoch_den
+        epoch_acc = running_corrects / epoch_den
         print(f'Client Epoch Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}')
 
     val_acc = None
     if val_loader is not None:
         model.eval()
-        correct = 0
+        correct = 0.0
         total = 0
         with torch.no_grad():
             for v_inputs, v_labels in val_loader:
@@ -219,33 +382,24 @@ def train_client(
                 v_labels = v_labels.to(device)
                 v_outputs = model(v_inputs)
                 _, v_preds = torch.max(v_outputs, 1)
-                correct += torch.sum(v_preds == v_labels.data)
+                correct += torch.sum(v_preds == v_labels.data).item()
                 total += v_labels.size(0)
-        val_acc = correct.double() / total
+        val_acc = correct / max(1, total)
         print(f'Client Validation Acc: {val_acc:.4f}')
 
+    local_norm_den = max(1, processed_steps)
     return (
         model.state_dict(),
         local_epoch_norm_max,
-        local_norm_sum / (num_epochs_per_round * (len(train_loader.dataset) / batch_size)),
+        local_norm_sum / local_norm_den,
         epoch_loss,
-        epoch_acc.item(),
-        val_acc.item() if val_acc is not None else None,
+        float(epoch_acc),
+        float(val_acc) if val_acc is not None else None,
         client_flops,
     )
 
-def aggregate_models(global_model, aggregated_updates, num_participants, bit, quantize):
+def aggregate_models(global_model, aggregated_updates, num_participants):
     global_dict = global_model.state_dict()
-
-    compression_flops = 0.0
-    decompression_flops = 0.0
-    if quantize:
-        q = Quantizer(bit)
-        for name in aggregated_updates.keys():
-            aggregated_updates[name] = q(aggregated_updates[name])
-        print("quantize success")
-        compression_flops = q.compression_flops
-        decompression_flops = q.decompression_flops
 
     param_diffs_norm = torch.sqrt(
         sum(torch.norm(aggregated_updates[name] / num_participants, p=2) ** 2 for name in aggregated_updates.keys())
@@ -258,13 +412,13 @@ def aggregate_models(global_model, aggregated_updates, num_participants, bit, qu
         ).float()
 
     global_model.load_state_dict(global_dict)
-    return global_model, param_diffs_norm, global_step_size, compression_flops, decompression_flops
+    return global_model, param_diffs_norm, global_step_size
 
 
 def validate_model(model, val_loader, forward_flops_per_sample=None):
     model.eval()
     running_loss = 0.0
-    running_corrects = 0
+    running_corrects = 0.0
     eval_flops = 0.0
     if forward_flops_per_sample is None:
         forward_flops_per_sample = estimate_flops_per_sample(model)["forward"]
@@ -278,13 +432,14 @@ def validate_model(model, val_loader, forward_flops_per_sample=None):
             loss = criterion(outputs, labels)
 
             running_loss += loss.item() * inputs.size(0)
-            running_corrects += torch.sum(preds == labels.data)
+            running_corrects += torch.sum(preds == labels.data).item()
             eval_flops += forward_flops_per_sample * inputs.size(0)
 
-    val_loss = running_loss / len(val_loader.dataset)
-    val_acc = running_corrects.double() / len(val_loader.dataset)
+    eval_den = max(1, len(val_loader.dataset))
+    val_loss = running_loss / eval_den
+    val_acc = running_corrects / eval_den
     print(f'Validation Loss: {val_loss:.4f} Acc: {val_acc:.4f}')
-    return val_acc, eval_flops
+    return torch.tensor(val_acc), eval_flops
 
 
 model_flops = estimate_flops_per_sample(global_model)
@@ -334,8 +489,14 @@ for round_idx in range(num_rounds):
     val_acc_clients = []
     local_norm_max_all = 0.0
     local_norm_average_all = 0.0
-    aggregated_updates = {name: torch.zeros_like(param) for name, param in global_state.items()}
+    aggregated_updates = {
+        name: torch.zeros_like(param, dtype=torch.float32) for name, param in global_state.items()
+    }
     round_flops = 0.0
+    round_upload_traffic = 0
+    round_upload_traffic_by_client = []
+    round_compression_flops = 0.0
+    round_decompression_flops = 0.0
 
     for client_id in selected_ids:
         client_dataset = client_datasets[client_id]
@@ -375,29 +536,44 @@ for round_idx in range(num_rounds):
         cos_sims.append(cos.item())
 
         update = {name: global_state[name] - updated_state_dict[name] for name in global_state.keys()}
-        participating_updates.append(update)
+        # Client communication path:
+        # local update -> (optional) quantization -> serialization bytes -> server deserialization/reconstruction.
+        if quantize:
+            quantized_payload, client_compression_flops = quantize_client_payload(update, bit)
+            serialized_payload = serialize_client_payload(quantized_payload, quantized=True)
+            server_packet, _ = deserialize_client_payload(serialized_payload)
+            reconstructed_update, client_decompression_flops = dequantize_client_payload(server_packet)
+        else:
+            serialized_payload = serialize_client_payload(update, quantized=False)
+            server_packet, _ = deserialize_client_payload(serialized_payload)
+            reconstructed_update = {
+                name: entry["values"].detach().cpu().float() for name, entry in server_packet.items()
+            }
+            client_compression_flops = 0.0
+            client_decompression_flops = 0.0
+
+        participating_updates.append(reconstructed_update)
+        upload_bytes_client = len(serialized_payload)
+        round_upload_traffic += upload_bytes_client
+        round_upload_traffic_by_client.append(upload_bytes_client)
+        round_compression_flops += client_compression_flops
+        round_decompression_flops += client_decompression_flops
         for name in aggregated_updates.keys():
-            aggregated_updates[name] += update[name]
+            aggregated_updates[name] += reconstructed_update[name].to(aggregated_updates[name].device)
 
         del updated_state_dict
         del client_model
         cleanup_memory()
 
-    (
-        global_model,
-        global_gradient_norm,
-        global_step_size,
-        compression_flops,
-        decompression_flops,
-    ) = aggregate_models(global_model, aggregated_updates, num_participants, bit, quantize)
+    global_model, global_gradient_norm, global_step_size = aggregate_models(
+        global_model, aggregated_updates, num_participants
+    )
 
     acc, server_eval_flops = validate_model(
         global_model, val_loader, forward_flops_per_sample=model_flops["forward"]
     )
     round_flops += server_eval_flops
     total_flops += round_flops
-    round_compression_flops = compression_flops
-    round_decompression_flops = decompression_flops
     total_compression_flops += round_compression_flops
     total_decompression_flops += round_decompression_flops
 
@@ -422,12 +598,17 @@ for round_idx in range(num_rounds):
         "acc_servers_highest": acc_servers_mean + acc_servers_std,
     }
 
-    # Total download traffic accounts for all participating clients
-    download_traffic = tensor_dict_bytes(global_state, bit=32) * 10
-    upload_bit = bit if quantize else 32
-    upload_traffic = sum(tensor_dict_bytes(update, bit=upload_bit) for update in participating_updates)
+    # Download traffic is counted only for clients that actively participate this round.
+    global_model_packet = serialize_client_payload(global_state, quantized=False)
+    download_traffic_per_client = len(global_model_packet)
+    download_traffic = download_traffic_per_client * num_participants
+    upload_traffic = round_upload_traffic
     upload_traffic_per_client = upload_traffic / num_participants
+    report["num_active_clients"] = num_participants
     report["upload_traffic_per_client"] = upload_traffic_per_client
+    report["download_traffic_per_client"] = download_traffic_per_client
+    report["upload_traffic_per_client_min"] = min(round_upload_traffic_by_client)
+    report["upload_traffic_per_client_max"] = max(round_upload_traffic_by_client)
     upload_sparsity_mean = float(
         np.mean([tensor_dict_sparsity_mean(update) for update in participating_updates])
     )
@@ -436,6 +617,7 @@ for round_idx in range(num_rounds):
     total_download_traffic += download_traffic
     report["upload_traffic"] = upload_traffic
     report["download_traffic"] = download_traffic
+    report["round_total_traffic"] = upload_traffic + download_traffic
     report["upload_sparsity_mean"] = upload_sparsity_mean
     report["download_sparsity_mean"] = download_sparsity_mean
     report["overall_traffic"] = total_upload_traffic + total_download_traffic
@@ -463,9 +645,9 @@ for round_idx in range(num_rounds):
         + "\t"
         + (f"{global_gradient_norm.item()}")
         + "\t"
-        + (f"{local_norm_max_all.item()/num_participants}")
+        + (f"{local_norm_max_all/num_participants}")
         + "\t"
-        + (f"{local_norm_average_all.item()/num_participants}")
+        + (f"{local_norm_average_all/num_participants}")
         + "\t"
         + (f"{global_step_size}")
         + '\n'
