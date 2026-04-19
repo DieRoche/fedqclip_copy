@@ -114,6 +114,67 @@ def tensor_dict_sparsity_mean(tensor_dict):
     return total_zeros / total_elements
 
 
+def payload_byte_size(payload):
+    """Return payload size in bytes for bytes-like or tensor-dict payloads."""
+    if isinstance(payload, (bytes, bytearray)):
+        return len(payload)
+    if isinstance(payload, dict):
+        total = 0
+        for value in payload.values():
+            if torch.is_tensor(value):
+                total += value.element_size() * value.numel()
+            elif isinstance(value, dict):
+                total += payload_byte_size(value)
+            elif isinstance(value, (tuple, list)):
+                for item in value:
+                    if isinstance(item, int):
+                        total += 4
+            elif isinstance(value, (int, float)):
+                total += 8
+        return total
+    return 0
+
+
+def compute_upload_traffic_for_round(client_payload_sizes):
+    """Per-round upload traffic from active clients only."""
+    return int(sum(client_payload_sizes))
+
+
+def compute_download_traffic_for_round(server_payload, num_active_clients):
+    """Per-round download traffic from server to active clients only."""
+    payload_size = payload_byte_size(server_payload)
+    return int(payload_size * num_active_clients), int(payload_size)
+
+
+def compute_overall_traffic_for_round(upload_traffic, download_traffic):
+    """Per-round total traffic."""
+    return int(upload_traffic + download_traffic)
+
+
+def compute_server_aggregation_flops(aggregated_updates, num_active_clients):
+    """
+    Estimate server-side aggregation/update FLOPs:
+    - summation across active clients
+    - averaging/scaling and model update
+    """
+    if num_active_clients <= 0:
+        return 0.0
+    aggregation_flops = 0.0
+    for tensor in aggregated_updates.values():
+        numel = tensor.numel()
+        # client summation + mean/scaling + model update arithmetic.
+        aggregation_flops += (max(0, num_active_clients - 1) * numel)
+        aggregation_flops += (3 * numel)
+    return float(aggregation_flops)
+
+
+def update_total_flops_metrics(total_round_and_serialization_flops, total_compression_path_flops, round_flops, round_flops_compression):
+    total_round_and_serialization_flops += round_flops
+    total_compression_path_flops += round_flops_compression
+    total_flops = total_round_and_serialization_flops + total_compression_path_flops
+    return total_round_and_serialization_flops, total_compression_path_flops, total_flops
+
+
 def _dtype_from_bit(bit):
     if bit <= 8:
         return torch.uint8, np.uint8
@@ -459,15 +520,24 @@ f_trainloss = open(trainloss_file, 'a')
 
 total_upload_traffic = 0
 total_download_traffic = 0
+total_round_and_serialization_flops = 0.0
+total_flops_compression = 0.0
 total_flops = 0.0
-total_compression_flops = 0.0
-total_decompression_flops = 0.0
 
 # Log the initial (round 0) metrics so that WandB captures the baseline accuracy.
 initial_acc, initial_eval_flops = validate_model(
     global_model, val_loader, forward_flops_per_sample=model_flops["forward"]
 )
-total_flops += initial_eval_flops
+(
+    total_round_and_serialization_flops,
+    total_flops_compression,
+    total_flops,
+) = update_total_flops_metrics(
+    total_round_and_serialization_flops,
+    total_flops_compression,
+    initial_eval_flops,
+    0.0,
+)
 initial_report = {
     "round": 0,
     "acc_servers": initial_acc.item(),
@@ -475,9 +545,8 @@ initial_report = {
     "acc_servers_highest": initial_acc.item(),
     "round_flops": initial_eval_flops,
     "total_flops": total_flops,
-    "total_flops_compression": total_compression_flops,
-    "total_flops_decompression": total_decompression_flops,
-    "total_flops_including_compression": total_flops,
+    "round_flops_compression": 0.0,
+    "total_flops_compression": total_flops_compression,
 }
 wandb.log(initial_report, step=0)
 print(f"Initial Validation Acc: {initial_acc.item():.4f}")
@@ -499,10 +568,8 @@ for round_idx in range(num_rounds):
         name: torch.zeros_like(param, dtype=torch.float32) for name, param in global_state.items()
     }
     round_flops = 0.0
-    round_upload_traffic = 0
     round_upload_traffic_by_client = []
-    round_compression_flops = 0.0
-    round_decompression_flops = 0.0
+    round_flops_compression = 0.0
 
     for client_id in selected_ids:
         client_dataset = client_datasets[client_id]
@@ -560,10 +627,8 @@ for round_idx in range(num_rounds):
 
         participating_updates.append(reconstructed_update)
         upload_bytes_client = len(serialized_payload)
-        round_upload_traffic += upload_bytes_client
         round_upload_traffic_by_client.append(upload_bytes_client)
-        round_compression_flops += client_compression_flops
-        round_decompression_flops += client_decompression_flops
+        round_flops_compression += (client_compression_flops + client_decompression_flops)
         for name in aggregated_updates.keys():
             aggregated_updates[name] += reconstructed_update[name].to(aggregated_updates[name].device)
 
@@ -574,14 +639,22 @@ for round_idx in range(num_rounds):
     global_model, global_gradient_norm, global_step_size = aggregate_models(
         global_model, aggregated_updates, num_participants
     )
+    round_flops += compute_server_aggregation_flops(aggregated_updates, num_participants)
 
     acc, server_eval_flops = validate_model(
         global_model, val_loader, forward_flops_per_sample=model_flops["forward"]
     )
     round_flops += server_eval_flops
-    total_flops += round_flops
-    total_compression_flops += round_compression_flops
-    total_decompression_flops += round_decompression_flops
+    (
+        total_round_and_serialization_flops,
+        total_flops_compression,
+        total_flops,
+    ) = update_total_flops_metrics(
+        total_round_and_serialization_flops,
+        total_flops_compression,
+        round_flops,
+        round_flops_compression,
+    )
 
     cos_mean = np.mean(cos_sims)
     cos_std = np.std(cos_sims)
@@ -606,9 +679,10 @@ for round_idx in range(num_rounds):
 
     # Download traffic is counted only for clients that actively participate this round.
     global_model_packet = serialize_client_payload(global_state, quantized=False)
-    download_traffic_per_client = len(global_model_packet)
-    download_traffic = download_traffic_per_client * num_participants
-    upload_traffic = round_upload_traffic
+    download_traffic, download_traffic_per_client = compute_download_traffic_for_round(
+        global_model_packet, num_participants
+    )
+    upload_traffic = compute_upload_traffic_for_round(round_upload_traffic_by_client)
     upload_traffic_per_client = upload_traffic / num_participants
     report["num_active_clients"] = num_participants
     report["upload_traffic_per_client"] = upload_traffic_per_client
@@ -623,19 +697,14 @@ for round_idx in range(num_rounds):
     total_download_traffic += download_traffic
     report["upload_traffic"] = upload_traffic
     report["download_traffic"] = download_traffic
-    report["round_total_traffic"] = upload_traffic + download_traffic
+    report["round_total_traffic"] = compute_overall_traffic_for_round(upload_traffic, download_traffic)
     report["upload_sparsity_mean"] = upload_sparsity_mean
     report["download_sparsity_mean"] = download_sparsity_mean
-    report["overall_traffic"] = total_upload_traffic + total_download_traffic
+    report["overall_traffic"] = compute_overall_traffic_for_round(upload_traffic, download_traffic)
     report["round_flops"] = round_flops
     report["total_flops"] = total_flops
-    report["round_flops_compression"] = round_compression_flops
-    report["round_flops_decompression"] = round_decompression_flops
-    report["total_flops_compression"] = total_compression_flops
-    report["total_flops_decompression"] = total_decompression_flops
-    report["total_flops_including_compression"] = (
-        total_flops + total_compression_flops + total_decompression_flops
-    )
+    report["round_flops_compression"] = round_flops_compression
+    report["total_flops_compression"] = total_flops_compression
 
     report["round"] = round_idx + 1
 
