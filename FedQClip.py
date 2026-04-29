@@ -216,7 +216,8 @@ def quantize_client_payload(tensor_dict, bit):
 def estimate_serialization_flops(payload, quantized=True):
     """
     Lightweight estimate for payload (de)serialization arithmetic.
-    Count roughly one flop per scalar metadata/value conversion.
+            # serialize_client_payload(..., quantized=False) casts to float32 before writing.
+            value_bytes = tensor.numel() * 4
     """
     serialization_flops = 0.0
     for name in sorted(payload.keys()):
