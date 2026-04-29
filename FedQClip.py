@@ -700,9 +700,11 @@ for round_idx in range(num_rounds):
     }
 
     # Download traffic is counted only for clients that actively participate this round.
-    round_serialization_flops += estimate_serialization_flops(global_state, quantized=False)
+    download_packet_serialization_flops = estimate_serialization_flops(global_state, quantized=False)
+    round_serialization_flops += download_packet_serialization_flops
     global_model_packet = serialize_client_payload(global_state, quantized=False)
-    round_serialization_flops += estimate_serialization_flops(global_state, quantized=False)
+    # One server-side serialization, then one client-side deserialization per active client.
+    round_serialization_flops += (download_packet_serialization_flops * num_participants)
     download_traffic, download_traffic_per_client = compute_download_traffic_for_round(
         global_model_packet, num_participants
     )
