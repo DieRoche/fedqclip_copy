@@ -213,6 +213,26 @@ def quantize_client_payload(tensor_dict, bit):
     return quantized_payload, compression_flops
 
 
+def estimate_serialization_flops(payload, quantized=True):
+    """
+    Lightweight estimate for payload (de)serialization arithmetic.
+            # serialize_client_payload(..., quantized=False) casts to float32 before writing.
+            value_bytes = tensor.numel() * 4
+    """
+    serialization_flops = 0.0
+    for name in sorted(payload.keys()):
+        serialization_flops += len(name)
+        if quantized:
+            entry = payload[name]
+            shape = entry["shape"]
+            numel = int(np.prod(shape)) if len(shape) > 0 else 1
+            serialization_flops += len(shape) + 3 + numel
+        else:
+            tensor = payload[name]
+            serialization_flops += tensor.dim() + tensor.numel()
+    return serialization_flops
+
+
 def serialize_client_payload(payload, quantized=True):
     """
     Serialize client payload into deterministic bytes.
@@ -545,6 +565,11 @@ initial_report = {
     "acc_servers_highest": initial_acc.item(),
     "round_flops": initial_eval_flops,
     "total_flops": total_flops,
+    "compression_flops_clients": 0.0,
+    "compression_flops_server": 0.0,
+    "decompression_flops_clients": 0.0,
+    "decompression_flops_server": 0.0,
+    "serialization_flops": 0.0,
     "round_flops_compression": 0.0,
     "total_flops_compression": total_flops_compression,
 }
@@ -569,7 +594,11 @@ for round_idx in range(num_rounds):
     }
     round_flops = 0.0
     round_upload_traffic_by_client = []
-    round_flops_compression = 0.0
+    round_compression_flops_clients = 0.0
+    round_compression_flops_server = 0.0
+    round_decompression_flops_clients = 0.0
+    round_decompression_flops_server = 0.0
+    round_serialization_flops = 0.0
 
     for client_id in selected_ids:
         client_dataset = client_datasets[client_id]
@@ -613,11 +642,15 @@ for round_idx in range(num_rounds):
         # local update -> (optional) quantization -> serialization bytes -> server deserialization/reconstruction.
         if quantize:
             quantized_payload, client_compression_flops = quantize_client_payload(update, bit)
+            round_serialization_flops += estimate_serialization_flops(quantized_payload, quantized=True)
             serialized_payload = serialize_client_payload(quantized_payload, quantized=True)
+            round_serialization_flops += estimate_serialization_flops(quantized_payload, quantized=True)
             server_packet, _ = deserialize_client_payload(serialized_payload)
             reconstructed_update, client_decompression_flops = dequantize_client_payload(server_packet)
         else:
+            round_serialization_flops += estimate_serialization_flops(update, quantized=False)
             serialized_payload = serialize_client_payload(update, quantized=False)
+            round_serialization_flops += estimate_serialization_flops(update, quantized=False)
             server_packet, _ = deserialize_client_payload(serialized_payload)
             reconstructed_update = {
                 name: entry["values"].detach().cpu().float() for name, entry in server_packet.items()
@@ -628,7 +661,8 @@ for round_idx in range(num_rounds):
         participating_updates.append(reconstructed_update)
         upload_bytes_client = len(serialized_payload)
         round_upload_traffic_by_client.append(upload_bytes_client)
-        round_flops_compression += (client_compression_flops + client_decompression_flops)
+        round_compression_flops_clients += client_compression_flops
+        round_decompression_flops_server += client_decompression_flops
         for name in aggregated_updates.keys():
             aggregated_updates[name] += reconstructed_update[name].to(aggregated_updates[name].device)
 
@@ -645,17 +679,6 @@ for round_idx in range(num_rounds):
         global_model, val_loader, forward_flops_per_sample=model_flops["forward"]
     )
     round_flops += server_eval_flops
-    (
-        total_round_and_serialization_flops,
-        total_flops_compression,
-        total_flops,
-    ) = update_total_flops_metrics(
-        total_round_and_serialization_flops,
-        total_flops_compression,
-        round_flops,
-        round_flops_compression,
-    )
-
     cos_mean = np.mean(cos_sims)
     cos_std = np.std(cos_sims)
     training_loss_mean = np.mean(training_losses)
@@ -678,7 +701,11 @@ for round_idx in range(num_rounds):
     }
 
     # Download traffic is counted only for clients that actively participate this round.
+    download_packet_serialization_flops = estimate_serialization_flops(global_state, quantized=False)
+    round_serialization_flops += download_packet_serialization_flops
     global_model_packet = serialize_client_payload(global_state, quantized=False)
+    # One server-side serialization, then one client-side deserialization per active client.
+    round_serialization_flops += (download_packet_serialization_flops * num_participants)
     download_traffic, download_traffic_per_client = compute_download_traffic_for_round(
         global_model_packet, num_participants
     )
@@ -695,6 +722,23 @@ for round_idx in range(num_rounds):
     download_sparsity_mean = tensor_dict_sparsity_mean(global_state)
     total_upload_traffic += upload_traffic
     total_download_traffic += download_traffic
+    round_flops_compression = (
+        round_compression_flops_clients
+        + round_compression_flops_server
+        + round_decompression_flops_clients
+        + round_decompression_flops_server
+        + round_serialization_flops
+    )
+    (
+        total_round_and_serialization_flops,
+        total_flops_compression,
+        total_flops,
+    ) = update_total_flops_metrics(
+        total_round_and_serialization_flops,
+        total_flops_compression,
+        round_flops,
+        round_flops_compression,
+    )
     report["upload_traffic"] = upload_traffic
     report["download_traffic"] = download_traffic
     report["round_total_traffic"] = compute_overall_traffic_for_round(upload_traffic, download_traffic)
@@ -703,6 +747,11 @@ for round_idx in range(num_rounds):
     report["overall_traffic"] = compute_overall_traffic_for_round(upload_traffic, download_traffic)
     report["round_flops"] = round_flops
     report["total_flops"] = total_flops
+    report["compression_flops_clients"] = round_compression_flops_clients
+    report["compression_flops_server"] = round_compression_flops_server
+    report["decompression_flops_clients"] = round_decompression_flops_clients
+    report["decompression_flops_server"] = round_decompression_flops_server
+    report["serialization_flops"] = round_serialization_flops
     report["round_flops_compression"] = round_flops_compression
     report["total_flops_compression"] = total_flops_compression
 
